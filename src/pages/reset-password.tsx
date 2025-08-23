@@ -36,7 +36,7 @@ export default function ResetPassword() {
 
   const onSubmit = async (data: z.infer<typeof resetPasswordSchema>) => {
     try {
-      const response = await apiRequest("POST", "/api/auth/reset-password", {
+        await apiRequest("POST", "/api/auth/reset-password", {
         token: token,
         newPassword: data.newPassword,
       });
