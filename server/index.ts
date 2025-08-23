@@ -10,7 +10,9 @@ const app = express();
 
 
 app.use(cors({
-  origin: "http://localhost:5173", // your Vite dev server
+  origin: process.env.NODE_ENV === "production" 
+    ? ["https://eventfundishere.onrender.com", process.env.FRONTEND_URL].filter(Boolean)
+    : "http://localhost:5173",
   credentials: true,               // allow cookies
 }));
 
