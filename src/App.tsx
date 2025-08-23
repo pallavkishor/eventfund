@@ -11,8 +11,6 @@ import ManagerLogin from "@/pages/manager-login";
 import ForgotPassword from "@/pages/forgot-password";
 import ResetPassword from "@/pages/reset-password";
 import NotFound from "@/pages/not-found";
-import Footer from "@/pages/footer";
-
 
 function Router() {
   const { user, isLoading } = useAuth();
@@ -30,17 +28,23 @@ function Router() {
 
   return (
     <Switch>
-      <Route path="/" component={user ? ManagerDashboard : Landing} />
+      <Route path="/">
+        {() => user ? <ManagerDashboard /> : <Landing />}
+      </Route>
       <Route path="/login">
-        {() => <ManagerLogin />}
+        {() => user ? <ManagerDashboard /> : <ManagerLogin />}
       </Route>
       <Route path="/event/:accessCode" component={ContributorView} />
       <Route path="/invite/:token">
-        {(params) => <ManagerLogin inviteToken={params.token} />}
+        {(params) => user ? <ManagerDashboard /> : <ManagerLogin inviteToken={params.token} />}
       </Route>
-      <Route path="/forgot-password" component={ForgotPassword} />
-      <Route path="/reset-password/:token" component={ResetPassword} />
-      <Route  component={NotFound} />
+      <Route path="/forgot-password">
+        {() => user ? <ManagerDashboard /> : <ForgotPassword />}
+      </Route>
+      <Route path="/reset-password/:token">
+        {() => user ? <ManagerDashboard /> : <ResetPassword />}
+      </Route>
+      <Route component={NotFound} />
     </Switch>
   );
 }
@@ -49,13 +53,8 @@ function App() {
   return (
     <QueryClientProvider client={queryClient}>
       <TooltipProvider>
-        <div className="flex min-h-screen flex-col">
-          <main className="flex-grow">
-            <Toaster />
-            <Router />
-          </main>
-          <Footer />
-        </div>
+        <Toaster />
+        <Router />
       </TooltipProvider>
     </QueryClientProvider>
   );

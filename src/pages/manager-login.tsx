@@ -89,7 +89,7 @@ export default function ManagerLogin({ inviteToken }: ManagerLoginProps) {
     },
     onSuccess: async () => {
       await queryClient.invalidateQueries({ queryKey: ["/api/auth/me"] });
-      
+
       if (inviteToken) {
         // Accept the invite
         try {
@@ -111,7 +111,7 @@ export default function ManagerLogin({ inviteToken }: ManagerLoginProps) {
           description: "Logged in successfully!",
         });
       }
-      
+
       setLocation("/");
     },
     onError: (error: Error) => {
@@ -129,7 +129,7 @@ export default function ManagerLogin({ inviteToken }: ManagerLoginProps) {
     },
     onSuccess: async () => {
       await queryClient.invalidateQueries({ queryKey: ["/api/auth/me"] });
-      
+
       if (inviteToken) {
         // Accept the invite
         try {
@@ -151,7 +151,7 @@ export default function ManagerLogin({ inviteToken }: ManagerLoginProps) {
           description: "Account created successfully!",
         });
       }
-      
+
       setLocation("/");
     },
     onError: (error: Error) => {
