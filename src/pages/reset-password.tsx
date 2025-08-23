@@ -40,7 +40,7 @@ export default function ResetPassword() {
         token: token,
         newPassword: data.newPassword,
       });
-      const result = await response.json();
+      
       
       setResetSuccess(true);
       toast({

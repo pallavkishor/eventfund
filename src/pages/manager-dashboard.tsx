@@ -7,7 +7,7 @@ import { format } from "date-fns";
 import { NavigationHeader } from "@/components/navigation-header";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { Textarea } from "@/components/ui/textarea";
+
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
@@ -68,7 +68,7 @@ const editExpenseSchema = z.object({
 });
 
 export default function ManagerDashboard() {
-  const [selectedEventId, setSelectedEventId] = useState<string>("");
+  const [selectedEventId, ] = useState<string>("");
   const [showCreateEvent, setShowCreateEvent] = useState(false);
   const [showAddExpense, setShowAddExpense] = useState(false);
   const [showInviteManager, setShowInviteManager] = useState(false);

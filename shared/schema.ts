@@ -3,11 +3,11 @@ import {
   pgTable, 
   text, 
   varchar, 
-  integer, 
+   
   timestamp, 
   boolean, 
   decimal,
-  uuid,
+ 
   primaryKey
 } from "drizzle-orm/pg-core";
 import { relations } from "drizzle-orm";
