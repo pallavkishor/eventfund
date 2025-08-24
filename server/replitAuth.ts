@@ -38,7 +38,7 @@ export function getSession() {
     saveUninitialized: false,
     cookie: {
       httpOnly: true,
-      secure: process.env.NODE_ENV === 'production', // Only secure in production
+      secure: true,
       maxAge: sessionTtl,
     },
   });
@@ -84,30 +84,14 @@ export async function setupAuth(app: Express) {
     verified(null, user);
   };
 
-  // Get domains from environment variable
-  const domains = process.env.REPLIT_DOMAINS!.split(",");
-  
-  // Add localhost for development if not already included
-  if (process.env.NODE_ENV !== 'production' && !domains.includes('localhost')) {
-    domains.push('localhost');
-  }
-
-  // Helper function to determine protocol
-  const getProtocol = (domain: string) => {
-    return domain === 'localhost' || domain.startsWith('localhost:') 
-      ? 'http' 
-      : 'https';
-  };
-
-  // Register strategies for each domain
-  for (const domain of domains) {
-    const protocol = getProtocol(domain);
+  for (const domain of process.env
+    .REPLIT_DOMAINS!.split(",")) {
     const strategy = new Strategy(
       {
         name: `replitauth:${domain}`,
         config,
         scope: "openid email profile offline_access",
-        callbackURL: `${protocol}://${domain}/api/callback`,
+        callbackURL: `https://${domain}/api/callback`,
       },
       verify,
     );
@@ -117,35 +101,19 @@ export async function setupAuth(app: Express) {
   passport.serializeUser((user: Express.User, cb) => cb(null, user));
   passport.deserializeUser((user: Express.User, cb) => cb(null, user));
 
+  
+
   app.get("/api/login", (req, res, next) => {
-    const hostname = req.hostname;
-    const strategyName = `replitauth:${hostname}`;
     
-    // Check if strategy exists
-    if (!passport._strategy(strategyName)) {
-      return res.status(500).json({ 
-        message: `Authentication strategy not found for domain: ${hostname}. Please check your REPLIT_DOMAINS configuration.` 
-      });
-    }
-    
-    passport.authenticate(strategyName, {
+    passport.authenticate(`replitauth:${req.hostname}`, {
       prompt: "login consent",
       scope: ["openid", "email", "profile", "offline_access"],
     })(req, res, next);
   });
 
   app.get("/api/callback", (req, res, next) => {
-    const hostname = req.hostname;
-    const strategyName = `replitauth:${hostname}`;
     
-    // Check if strategy exists
-    if (!passport._strategy(strategyName)) {
-      return res.status(500).json({ 
-        message: `Authentication strategy not found for domain: ${hostname}. Please check your REPLIT_DOMAINS configuration.` 
-      });
-    }
-    
-    passport.authenticate(strategyName, {
+    passport.authenticate(`replitauth:${req.hostname}`, {
       successReturnToOrRedirect: "/",
       failureRedirect: "/api/login",
     })(req, res, next);
