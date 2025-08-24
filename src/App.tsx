@@ -4,12 +4,12 @@ import { QueryClientProvider } from "@tanstack/react-query";
 import { Toaster } from "@/components/ui/toaster";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { useAuth } from "@/hooks/useAuth";
-import Landing from "@/pages/Landing";
-import Home from "@/pages/Home";
-import EventDetails from "@/pages/EventDeatils";
-import ContributorEvent from "@/pages/ContributorEvent";
-import NotFound from "@/pages/not-found";
-import InvitationHandler from "@/pages/InvitationHandler";
+import Landing from "./pages/Landing";
+import Home from "./pages/Home";
+import EventDetails from "./pages/EventDeatils";
+import ContributorEvent from "./pages/ContributorEvent";
+import NotFound from "./pages/not-found";
+import InvitationHandler from "./pages/InvitationHandler";
 
 function Router() {
   const { isAuthenticated, isLoading } = useAuth();
