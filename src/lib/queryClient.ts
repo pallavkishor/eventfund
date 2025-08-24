@@ -1,6 +1,4 @@
-import { QueryClient } from "@tanstack/react-query";
-import type { QueryFunctionContext } from "@tanstack/react-query";
-
+import { QueryClient, type QueryFunction } from "@tanstack/react-query";
 
 async function throwIfResNotOk(res: Response) {
   if (!res.ok) {
@@ -12,7 +10,7 @@ async function throwIfResNotOk(res: Response) {
 export async function apiRequest(
   method: string,
   url: string,
-  data?: unknown,
+  data?: unknown | undefined,
 ): Promise<Response> {
   const res = await fetch(url, {
     method,
@@ -26,24 +24,21 @@ export async function apiRequest(
 }
 
 type UnauthorizedBehavior = "returnNull" | "throw";
-
-export const getQueryFn =
-  <T>({ on401 }: { on401: UnauthorizedBehavior }) =>
-  async ({ queryKey, signal }: QueryFunctionContext): Promise<T | null> => {
-    // queryKey is readonly unknown[], so cast if you know it's strings
-    const url = (queryKey as string[]).join("/");
-
-    const res = await fetch(url, {
+export const getQueryFn: <T>(options: {
+  on401: UnauthorizedBehavior;
+}) => QueryFunction<T> =
+  ({ on401: unauthorizedBehavior }) =>
+  async ({ queryKey }) => {
+    const res = await fetch(queryKey.join("/") as string, {
       credentials: "include",
-      signal,
     });
 
-    if (on401 === "returnNull" && res.status === 401) {
+    if (unauthorizedBehavior === "returnNull" && res.status === 401) {
       return null;
     }
 
     await throwIfResNotOk(res);
-    return (await res.json()) as T;
+    return await res.json();
   };
 
 export const queryClient = new QueryClient({

@@ -3,24 +3,10 @@ import type { Request, Response, NextFunction } from "express";
 import { registerRoutes } from "./routes.ts";
 import { setupVite, serveStatic, log } from "./vite.ts";
 
-import cors from "cors";
-
-
 const app = express();
-
-
-app.use(cors({
-  origin: process.env.NODE_ENV === "production" 
-    ? ["https://eventfundworld.onrender.com", process.env.FRONTEND_URL].filter(Boolean)
-    : "http://localhost:5173",
-  credentials: true,               // allow cookies
-}));
-
-// Middleware for parsing requests
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 
-// Logging middleware for API routes
 app.use((req, res, next) => {
   const start = Date.now();
   const path = req.path;
@@ -34,7 +20,7 @@ app.use((req, res, next) => {
 
   res.on("finish", () => {
     const duration = Date.now() - start;
-    if (path.startsWith("/api/")) {
+    if (path.startsWith("/api")) {
       let logLine = `${req.method} ${path} ${res.statusCode} in ${duration}ms`;
       if (capturedJsonResponse) {
         logLine += ` :: ${JSON.stringify(capturedJsonResponse)}`;
@@ -51,33 +37,55 @@ app.use((req, res, next) => {
   next();
 });
 
-
-
-
 (async () => {
-  // Register all routes
   const server = await registerRoutes(app);
 
-  // Error handler
   app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
     const status = err.status || err.statusCode || 500;
     const message = err.message || "Internal Server Error";
+
     res.status(status).json({ message });
     throw err;
   });
 
-  // Setup Vite in development, serve static in production
+  // importantly only setup vite in development and after
+  // setting up all the other routes so the catch-all route
+  // doesn't interfere with the other routes
   if (app.get("env") === "development") {
     await setupVite(app, server);
   } else {
     serveStatic(app);
   }
 
-  // Port setup
-  const port = parseInt(process.env.PORT || "5000", 10);
+  // ALWAYS serve the app on the port specified in the environment variable PORT
+  // Other ports are firewalled. Default to 5000 if not specified.
+  // this serves both the API and the client.
+  // It is the only port that is not firewalled.
+  const port = parseInt(process.env.PORT || '5000', 10);
+  
+  // Try different listening configurations based on environment
+  const startServer = () => {
+    try {
+      // Option 1: Try with host binding
+      server.listen(port, "0.0.0.0", () => {
+        log(`serving on port ${port}`);
+      });
+    } catch (error) {
+      console.error("Failed to bind to 0.0.0.0, trying localhost:", error);
+      try {
+        // Option 2: Fallback to localhost
+        server.listen(port, "localhost", () => {
+          log(`serving on localhost:${port}`);
+        });
+      } catch (fallbackError) {
+        console.error("Failed to bind to localhost, trying port only:", fallbackError);
+        // Option 3: Last resort - just the port
+        server.listen(port, () => {
+          log(`serving on port ${port}`);
+        });
+      }
+    }
+  };
 
-  // ✅ Clean listen (removed reusePort, safe cross-platform)
-  server.listen(port, "0.0.0.0", () => {
-    log(`🚀 Server running at http://localhost:${port}`);
-  });
+  startServer();
 })();

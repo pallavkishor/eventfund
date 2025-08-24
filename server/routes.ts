@@ -1,666 +1,448 @@
 import type { Express } from "express";
 import { createServer, type Server } from "http";
-import { WebSocketServer, WebSocket } from "ws";
 import { storage } from "./storage.ts";
-import bcrypt from "bcrypt";
-import session from "express-session";
-import pgSession from "connect-pg-simple";
-import { 
-  insertUserSchema, 
-  insertEventSchema, 
-  insertContributorSchema, 
-  insertContributionSchema,
-  insertExpenseSchema,
-  insertManagerInviteSchema,
-  updateEventSchema,
-  updateExpenseSchema,
-  passwordResetRequestSchema,
-  passwordResetSchema 
-} from "../shared/schema.ts";
-import { sendManagerInvite, sendPasswordResetEmail } from "./emailService.ts";
+import { setupAuth, isAuthenticated } from "./replitAuth.ts";
+import { sendPasswordResetEmail, sendCoManagerInvitation } from "./services/emailService.ts";
+import { upload, getFileUrl } from "./services/fileService.ts";
+import { insertEventSchema, insertContributionSchema, insertExpenseSchema, insertManagerInvitationSchema } from "../shared/schema.ts";
 import { randomUUID } from "crypto";
-
-const SALT_ROUNDS = 12;
-
-interface AuthenticatedRequest extends Express.Request {
-  session: session.Session & session.SessionData & {
-    userId?: string;
-  };
-  body: any;
-  params: any;
-}
-
-// PostgreSQL session store
-const PostgreSQLStore = pgSession(session);
-
-// Session middleware with PostgreSQL store
-const sessionMiddleware = session({
-  store: new PostgreSQLStore({
-    // Use your existing database connection string
-    conString: process.env.DATABASE_URL || "postgresql://username:password@localhost:5432/your_database",
-    // Alternative: if you have a pg Pool instance, you can use it instead
-    // pool: yourPgPool,
-    
-    // Table name for sessions (will be created automatically)
-    tableName: 'session',
-    
-    // Session cleanup options
-    pruneSessionInterval: 60, // Cleanup expired sessions every 60 seconds
-    
-    // Optional: customize session table schema
-    createTableIfMissing: true,
-  }),
-  
-  secret: process.env.SESSION_SECRET || "dev-secret-key",
-  resave: false,
-  saveUninitialized: false,
-  
-  cookie: {
-    secure: process.env.NODE_ENV === "production",
-    httpOnly: true,
-    sameSite: process.env.NODE_ENV === "production" ? 'none' : 'lax',
-    maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
-  },
-  
-  // Session name (optional)
-  name: 'connect.sid',
-  
-  // Force session to be saved back to session store
-  rolling: true, // Reset expiration on activity
-});
-
-// Authentication middleware
-const requireAuth = (req: AuthenticatedRequest, res: any, next: any) => {
-  if (!req.session.userId) {
-    return res.status(401).json({ message: "Authentication required" });
-  }
-  next();
-};
-
-// Event manager authorization middleware
-const requireEventManager = async (req: AuthenticatedRequest, res: any, next: any) => {
-  const eventId = req.params.eventId || req.body.eventId;
-  if (!eventId) {
-    return res.status(400).json({ message: "Event ID required" });
-  }
-
-  const isManager = await storage.isEventManager(eventId, req.session.userId!);
-  if (!isManager) {
-    return res.status(403).json({ message: "Event manager access required" });
-  }
-  next();
-};
+import express from "express";
+import path from "path";
 
 export async function registerRoutes(app: Express): Promise<Server> {
-  app.use(sessionMiddleware);
+  // Auth middleware
+  await setupAuth(app);
 
-  // WebSocket setup with session support
-  const httpServer = createServer(app);
-  const wss = new WebSocketServer({ 
-    server: httpServer, 
-    path: '/ws',
-    verifyClient: (info) => {
-      // Optional: Add session verification for WebSocket connections
-      return true;
-    }
-  });
-
-  const clients = new Map<string, Set<WebSocket>>();
-
-  wss.on('connection', (ws: WebSocket, req) => {
-    const url = new URL(req.url!, `http://${req.headers.host}`);
-    const eventId = url.searchParams.get('eventId');
-    
-    if (eventId) {
-      if (!clients.has(eventId)) {
-        clients.set(eventId, new Set());
-      }
-      clients.get(eventId)!.add(ws);
-
-      ws.on('close', () => {
-        const eventClients = clients.get(eventId);
-        if (eventClients) {
-          eventClients.delete(ws);
-          if (eventClients.size === 0) {
-            clients.delete(eventId);
-          }
-        }
-      });
-    }
-  });
-
-  // Broadcast to event clients
-  const broadcastToEvent = (eventId: string, data: any) => {
-    const eventClients = clients.get(eventId);
-    if (eventClients) {
-      const message = JSON.stringify(data);
-      eventClients.forEach((client) => {
-        if (client.readyState === WebSocket.OPEN) {
-          client.send(message);
-        }
-      });
-    }
-  };
+  // Serve uploaded files
+  app.use('/api/files', express.static(path.join(process.cwd(), 'uploads')));
 
   // Auth routes
-  app.post('/api/auth/register', async (req, res) => {
+  app.get('/api/auth/user', isAuthenticated, async (req: any, res) => {
     try {
-      const { email, password, firstName, lastName } = insertUserSchema.parse(req.body);
-      
-      // Check if user exists
-      const existingUser = await storage.getUserByEmail(email);
-      if (existingUser) {
-        return res.status(400).json({ message: "User already exists" });
-      }
-
-      // Hash password
-      const hashedPassword = await bcrypt.hash(password, SALT_ROUNDS);
-      
-      // Create user
-      const user = await storage.createUser({
-        email,
-        password: hashedPassword,
-        firstName,
-        lastName,
-      });
-
-      (req as AuthenticatedRequest).session.userId = user.id;
-      
-      res.json({ 
-        user: { 
-          id: user.id, 
-          email: user.email, 
-          firstName: user.firstName, 
-          lastName: user.lastName 
-        } 
-      });
+      const userId = req.user.claims.sub;
+      const user = await storage.getUser(userId);
+      res.json(user);
     } catch (error) {
-      console.error("Registration error:", error);
-      res.status(400).json({ message: "Registration failed" });
+      console.error("Error fetching user:", error);
+      res.status(500).json({ message: "Failed to fetch user" });
     }
   });
 
-  app.post('/api/auth/login', async (req, res) => {
-    try {
-      const { email, password } = req.body;
-      
-      if (!email || !password) {
-        return res.status(400).json({ message: "Email and password required" });
-      }
-
-      const user = await storage.getUserByEmail(email);
-      if (!user) {
-        return res.status(401).json({ message: "Invalid credentials" });
-      }
-
-      const isValid = await bcrypt.compare(password, user.password);
-      if (!isValid) {
-        return res.status(401).json({ message: "Invalid credentials" });
-      }
-
-      (req as AuthenticatedRequest).session.userId = user.id;
-      
-      res.json({ 
-        user: { 
-          id: user.id, 
-          email: user.email, 
-          firstName: user.firstName, 
-          lastName: user.lastName 
-        } 
-      });
-    } catch (error) {
-      console.error("Login error:", error);
-      res.status(500).json({ message: "Login failed" });
-    }
-  });
-
-  app.post('/api/auth/logout', (req: AuthenticatedRequest, res) => {
-    req.session.destroy((err) => {
+  app.get('/api/logout', (req: any, res) => {
+    // Clear the session and redirect to Replit Auth logout
+    req.session.destroy((err: any) => {
       if (err) {
-        return res.status(500).json({ message: "Logout failed" });
+        console.error("Error destroying session:", err);
       }
-      res.json({ message: "Logged out" });
+      // Redirect to home page after logout
+      res.redirect('/');
     });
-  });
-
-  // ... rest of your routes remain the same ...
-
-  app.get('/api/auth/me', requireAuth, async (req: AuthenticatedRequest, res) => {
-    try {
-      const user = await storage.getUser(req.session.userId!);
-      if (!user) {
-        return res.status(404).json({ message: "User not found" });
-      }
-      
-      res.json({ 
-        user: { 
-          id: user.id, 
-          email: user.email, 
-          firstName: user.firstName, 
-          lastName: user.lastName 
-        } 
-      });
-    } catch (error) {
-      console.error("Get user error:", error);
-      res.status(500).json({ message: "Failed to get user" });
-    }
-  });
-
-  // Event routes
-  app.post('/api/events', requireAuth, async (req: AuthenticatedRequest, res) => {
-    try {
-      const eventData = insertEventSchema.parse(req.body);
-      const event = await storage.createEvent({
-        ...eventData,
-        createdById: req.session.userId!,
-      });
-      
-      res.json(event);
-    } catch (error) {
-      console.error("Create event error:", error);
-      res.status(400).json({ message: "Failed to create event" });
-    }
-  });
-
-  app.put('/api/events/:id', requireAuth, async (req: AuthenticatedRequest, res) => {
-    try {
-      const { id } = req.params;
-      const eventData = updateEventSchema.parse(req.body);
-      
-      // Check if user is event manager
-      const isManager = await storage.isEventManager(id, req.session.userId!);
-      if (!isManager) {
-        return res.status(403).json({ message: "Event manager access required" });
-      }
-      
-      const updatedEvent = await storage.updateEvent(id, eventData);
-      res.json(updatedEvent);
-    } catch (error) {
-      console.error("Update event error:", error);
-      res.status(400).json({ message: "Failed to update event" });
-    }
-  });
-
-  app.get('/api/events/my', requireAuth, async (req: AuthenticatedRequest, res) => {
-    try {
-      const events = await storage.getEventsByManager(req.session.userId!);
-      res.json(events);
-    } catch (error) {
-      console.error("Get events error:", error);
-      res.status(500).json({ message: "Failed to get events" });
-    }
-  });
-
-  app.get('/api/events/access/:accessCode', async (req, res) => {
-    try {
-      const { accessCode } = req.params;
-      const event = await storage.getEventByAccessCode(accessCode);
-      
-      if (!event) {
-        return res.status(404).json({ message: "Event not found" });
-      }
-      
-      const stats = await storage.getEventStats(event.id);
-      const expenses = await storage.getEventExpenses(event.id);
-      
-      res.json({
-        event,
-        stats,
-        expenses,
-      });
-    } catch (error) {
-      console.error("Get event by access code error:", error);
-      res.status(500).json({ message: "Failed to get event" });
-    }
-  });
-
-  app.get('/api/events/:eventId', requireAuth, requireEventManager, async (req: AuthenticatedRequest, res) => {
-    try {
-      const { eventId } = req.params;
-      const event = await storage.getEvent(eventId);
-      
-      if (!event) {
-        return res.status(404).json({ message: "Event not found" });
-      }
-      
-      const stats = await storage.getEventStats(eventId);
-      const contributions = await storage.getEventContributions(eventId);
-      const expenses = await storage.getEventExpenses(eventId);
-      
-      // Get contributor details for each contribution
-      const contributionsWithDetails = await Promise.all(
-        contributions.map(async (contribution) => {
-          const contributor = await storage.getContributor(contribution.contributorId);
-          return {
-            ...contribution,
-            contributor,
-          };
-        })
-      );
-      
-      res.json({
-        event,
-        stats,
-        contributions: contributionsWithDetails,
-        expenses,
-      });
-    } catch (error) {
-      console.error("Get event error:", error);
-      res.status(500).json({ message: "Failed to get event" });
-    }
-  });
-
-  // Contribution routes
-  app.post('/api/contributions', async (req, res) => {
-    try {
-      const { contributorData, contributionData } = req.body;
-      
-      // Validate input
-      const validatedContributor = insertContributorSchema.parse(contributorData);
-      const validatedContribution = insertContributionSchema.parse(contributionData);
-      
-      // Check if event exists
-      const event = await storage.getEvent(validatedContributor.eventId);
-      if (!event) {
-        return res.status(404).json({ message: "Event not found" });
-      }
-      
-      // Get or create contributor
-      let contributor = await storage.getContributorByEmail(
-        validatedContributor.eventId, 
-        validatedContributor.email
-      );
-      
-      if (!contributor) {
-        contributor = await storage.createContributor(validatedContributor);
-      }
-      
-      // Create contribution
-      const contribution = await storage.createContribution({
-        ...validatedContribution,
-        contributorId: contributor.id,
-      });
-      
-      // Broadcast update to event managers
-      broadcastToEvent(event.id, {
-        type: 'new_contribution',
-        contribution: {
-          ...contribution,
-          contributor,
-        },
-      });
-      
-      res.json({ contribution, contributor });
-    } catch (error) {
-      console.error("Create contribution error:", error);
-      res.status(400).json({ message: "Failed to create contribution" });
-    }
-  });
-
-  app.patch('/api/contributions/:contributionId', requireAuth, async (req: AuthenticatedRequest, res) => {
-    try {
-      const { contributionId } = req.params;
-      const { status } = req.body;
-      
-      if (!["approved", "rejected"].includes(status)) {
-        return res.status(400).json({ message: "Invalid status" });
-      }
-      
-      const contribution = await storage.getContribution(contributionId);
-      if (!contribution) {
-        return res.status(404).json({ message: "Contribution not found" });
-      }
-      
-      // Check if user is event manager
-      const isManager = await storage.isEventManager(contribution.eventId, req.session.userId!);
-      if (!isManager) {
-        return res.status(403).json({ message: "Event manager access required" });
-      }
-      
-      const updatedContribution = await storage.updateContributionStatus(
-        contributionId, 
-        status, 
-        req.session.userId!
-      );
-      
-      // Get updated stats and broadcast
-      const stats = await storage.getEventStats(contribution.eventId);
-      broadcastToEvent(contribution.eventId, {
-        type: 'contribution_updated',
-        contribution: updatedContribution,
-        stats,
-      });
-      
-      res.json(updatedContribution);
-    } catch (error) {
-      console.error("Update contribution error:", error);
-      res.status(500).json({ message: "Failed to update contribution" });
-    }
-  });
-
-  app.get('/api/contributors/:contributorId/contributions', async (req, res) => {
-    try {
-      const { contributorId } = req.params;
-      const contributions = await storage.getContributorContributions(contributorId);
-      res.json(contributions);
-    } catch (error) {
-      console.error("Get contributor contributions error:", error);
-      res.status(500).json({ message: "Failed to get contributions" });
-    }
-  });
-
-  // Expense routes
-  app.post('/api/expenses', requireAuth, async (req: AuthenticatedRequest, res) => {
-    try {
-      const expenseData = insertExpenseSchema.parse(req.body);
-      
-      // Check if user is event manager
-      const isManager = await storage.isEventManager(expenseData.eventId, req.session.userId!);
-      if (!isManager) {
-        return res.status(403).json({ message: "Event manager access required" });
-      }
-      
-      const expense = await storage.createExpense({
-        ...expenseData,
-        addedById: req.session.userId!,
-      });
-      
-      // Get updated stats and broadcast
-      const stats = await storage.getEventStats(expenseData.eventId);
-      broadcastToEvent(expenseData.eventId, {
-        type: 'expense_added',
-        expense,
-        stats,
-      });
-      
-      res.json(expense);
-    } catch (error) {
-      console.error("Create expense error:", error);
-      res.status(400).json({ message: "Failed to create expense" });
-    }
-  });
-
-  app.put('/api/expenses/:id', requireAuth, async (req: AuthenticatedRequest, res) => {
-    try {
-      const { id } = req.params;
-      const expenseData = updateExpenseSchema.parse(req.body);
-      
-      // Get the expense to check event access
-      const expense = await storage.getEvent(req.body.eventId);
-      if (!expense) {
-        return res.status(404).json({ message: "Event not found" });
-      }
-      
-      // Check if user is event manager
-      const isManager = await storage.isEventManager(req.body.eventId, req.session.userId!);
-      if (!isManager) {
-        return res.status(403).json({ message: "Event manager access required" });
-      }
-      
-      const updatedExpense = await storage.updateExpense(id, expenseData);
-      
-      // Broadcast update to event managers
-      const stats = await storage.getEventStats(req.body.eventId);
-      broadcastToEvent(req.body.eventId, {
-        type: 'expense_updated',
-        expense: updatedExpense,
-        stats,
-      });
-      
-      res.json(updatedExpense);
-    } catch (error) {
-      console.error("Update expense error:", error);
-      res.status(400).json({ message: "Failed to update expense" });
-    }
-  });
-
-  // Manager invite routes
-  app.post('/api/invites', requireAuth, async (req: AuthenticatedRequest, res) => {
-    try {
-      const inviteData = insertManagerInviteSchema.parse(req.body);
-      
-      // Check if user is event manager
-      const isManager = await storage.isEventManager(inviteData.eventId, req.session.userId!);
-      if (!isManager) {
-        return res.status(403).json({ message: "Event manager access required" });
-      }
-      
-      // Get event details for email
-      const event = await storage.getEvent(inviteData.eventId);
-      if (!event) {
-        return res.status(404).json({ message: "Event not found" });
-      }
-      
-      const token = randomUUID();
-      const expiresAt = new Date(Date.now() + 2 * 60 * 60 * 1000); // 2 hours
-      
-      const invite = await storage.createManagerInvite({
-        ...inviteData,
-        invitedBy: req.session.userId!,
-        token,
-        expiresAt,
-      });
-      
-      // Send email invite
-      const inviteLink = `${(req as any).protocol}://${(req as any).get('host')}/invite/${token}`;
-      const emailSent = await sendManagerInvite(inviteData.email, inviteLink, event.title);
-      
-      if (!emailSent) {
-        console.error("Failed to send invite email");
-        // Don't fail the request, just log the error
-      }
-      
-      res.json({ invite, inviteLink, emailSent });
-    } catch (error) {
-      console.error("Create invite error:", error);
-      res.status(400).json({ message: "Failed to create invite" });
-    }
-  });
-
-  app.get('/api/invites/:token', async (req, res) => {
-    try {
-      const { token } = req.params;
-      const invite = await storage.getManagerInvite(token);
-      
-      if (!invite) {
-        return res.status(404).json({ message: "Invalid or expired invite" });
-      }
-      
-      const event = await storage.getEvent(invite.eventId);
-      res.json({ invite, event });
-    } catch (error) {
-      console.error("Get invite error:", error);
-      res.status(500).json({ message: "Failed to get invite" });
-    }
-  });
-
-  app.post('/api/invites/:token/accept', async (req: AuthenticatedRequest, res) => {
-    try {
-      const { token } = req.params;
-      const invite = await storage.getManagerInvite(token);
-      
-      if (!invite) {
-        return res.status(404).json({ message: "Invalid or expired invite" });
-      }
-      
-      if (!req.session.userId) {
-        return res.status(401).json({ message: "Authentication required" });
-      }
-      
-      // Add user as event manager
-      await storage.addEventManager(invite.eventId, req.session.userId);
-      
-      // Mark invite as used
-      await storage.useManagerInvite(token);
-      
-      res.json({ message: "Invite accepted successfully" });
-    } catch (error) {
-      console.error("Accept invite error:", error);
-      res.status(500).json({ message: "Failed to accept invite" });
-    }
   });
 
   // Password reset routes
   app.post('/api/auth/forgot-password', async (req, res) => {
     try {
-      const { email } = passwordResetRequestSchema.parse(req.body);
-      
-      const user = await storage.getUserByEmail(email);
-      if (!user) {
-        return res.json({ message: "If an account with that email exists, a password reset link has been sent." });
+      const { email } = req.body;
+      if (!email) {
+        return res.status(400).json({ message: "Email is required" });
       }
+
+      const resetToken = randomUUID();
+      // In a real app, you'd store this token in the database with expiration
+      // For now, we'll just send the email
       
-      const token = randomUUID();
-      const expiresAt = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
+      const success = await sendPasswordResetEmail(email, resetToken);
+      if (success) {
+        res.json({ message: "Password reset email sent successfully" });
+      } else {
+        res.status(500).json({ message: "Failed to send password reset email" });
+      }
+    } catch (error) {
+      console.error("Forgot password error:", error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+
+  // Event routes
+  app.get('/api/events', isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const events = await storage.getEventsByUserId(userId);
+      res.json(events);
+    } catch (error) {
+      console.error("Error fetching events:", error);
+      res.status(500).json({ message: "Failed to fetch events" });
+    }
+  });
+
+  app.post('/api/events', isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const eventData = insertEventSchema.parse(req.body);
       
-      await storage.createPasswordResetToken({
-        userId: user.id,
-        token,
-        expiresAt,
+      // Generate unique access code if not provided
+      if (!eventData.accessCode) {
+        eventData.accessCode = Math.random().toString(36).substring(2, 8).toUpperCase();
+      }
+
+      const event = await storage.createEvent(eventData, userId);
+      res.status(201).json(event);
+    } catch (error) {
+      console.error("Error creating event:", error);
+      res.status(500).json({ message: "Failed to create event" });
+    }
+  });
+
+  app.get('/api/events/:id', isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const eventId = req.params.id;
+      
+      // Check if user is a manager of this event
+      const isManager = await storage.isEventManager(eventId, userId);
+      if (!isManager) {
+        return res.status(403).json({ message: "Access denied" });
+      }
+
+      const event = await storage.getEventById(eventId);
+      if (!event) {
+        return res.status(404).json({ message: "Event not found" });
+      }
+
+      res.json(event);
+    } catch (error) {
+      console.error("Error fetching event:", error);
+      res.status(500).json({ message: "Failed to fetch event" });
+    }
+  });
+
+  app.put('/api/events/:id', isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const eventId = req.params.id;
+      
+      const isManager = await storage.isEventManager(eventId, userId);
+      if (!isManager) {
+        return res.status(403).json({ message: "Access denied" });
+      }
+
+      const updates = insertEventSchema.partial().parse(req.body);
+      const event = await storage.updateEvent(eventId, updates);
+      res.json(event);
+    } catch (error) {
+      console.error("Error updating event:", error);
+      res.status(500).json({ message: "Failed to update event" });
+    }
+  });
+
+  app.delete('/api/events/:id', isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const eventId = req.params.id;
+      
+      const isManager = await storage.isEventManager(eventId, userId);
+      if (!isManager) {
+        return res.status(403).json({ message: "Access denied" });
+      }
+
+      await storage.deleteEvent(eventId);
+      res.json({ message: "Event deleted successfully" });
+    } catch (error) {
+      console.error("Error deleting event:", error);
+      res.status(500).json({ message: "Failed to delete event" });
+    }
+  });
+
+  // Public event access (for contributors)
+  app.get('/api/events/access/:code', async (req, res) => {
+    try {
+      const accessCode = req.params.code.toUpperCase();
+      const event = await storage.getEventByAccessCode(accessCode);
+      
+      if (!event) {
+        return res.status(404).json({ message: "Event not found" });
+      }
+
+      res.json(event);
+    } catch (error) {
+      console.error("Error accessing event:", error);
+      res.status(500).json({ message: "Failed to access event" });
+    }
+  });
+
+  // Contribution routes
+  app.get('/api/events/:id/contributions', isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const eventId = req.params.id;
+      
+      const isManager = await storage.isEventManager(eventId, userId);
+      if (!isManager) {
+        return res.status(403).json({ message: "Access denied" });
+      }
+
+      const contributions = await storage.getContributionsByEventId(eventId);
+      res.json(contributions);
+    } catch (error) {
+      console.error("Error fetching contributions:", error);
+      res.status(500).json({ message: "Failed to fetch contributions" });
+    }
+  });
+
+  app.post('/api/events/:id/contributions', async (req, res) => {
+    try {
+      const eventId = req.params.id;
+      const contributionData = insertContributionSchema.parse({
+        ...req.body,
+        eventId,
       });
-      
-      const resetLink = `${(req as any).protocol}://${(req as any).get('host')}/reset-password/${token}`;
-      const emailSent = await sendPasswordResetEmail(email, resetLink);
-      
-      if (!emailSent) {
-        console.error("Failed to send password reset email");
-      }
-      
-      res.json({ message: "If an account with that email exists, a password reset link has been sent." });
+
+      const contribution = await storage.createContribution(contributionData);
+      res.status(201).json(contribution);
     } catch (error) {
-      console.error("Password reset request error:", error);
-      res.status(500).json({ message: "Failed to process password reset request" });
+      console.error("Error creating contribution:", error);
+      res.status(500).json({ message: "Failed to create contribution" });
     }
   });
 
-  app.post('/api/auth/reset-password', async (req, res) => {
+  app.get('/api/events/:id/contributions/contributor/:name', async (req, res) => {
     try {
-      const { token, newPassword } = passwordResetSchema.parse(req.body);
+      const eventId = req.params.id;
+      const contributorName = req.params.name;
       
-      const resetToken = await storage.getPasswordResetToken(token);
-      if (!resetToken) {
-        return res.status(400).json({ message: "Invalid or expired reset token" });
-      }
-      
-      const hashedPassword = await bcrypt.hash(newPassword, SALT_ROUNDS);
-      await storage.updateUserPassword(resetToken.userId, hashedPassword);
-      await storage.usePasswordResetToken(token);
-      
-      res.json({ message: "Password reset successfully" });
+      const contributions = await storage.getContributionsByContributorName(eventId, contributorName);
+      res.json(contributions);
     } catch (error) {
-      console.error("Password reset error:", error);
-      res.status(400).json({ message: "Failed to reset password" });
+      console.error("Error fetching contributor contributions:", error);
+      res.status(500).json({ message: "Failed to fetch contributions" });
     }
   });
 
-  // Cleanup expired invites periodically
-  setInterval(async () => {
+  app.put('/api/contributions/:id/approve', isAuthenticated, async (req: any, res) => {
     try {
-      await storage.cleanupExpiredInvites();
+      const userId = req.user.claims.sub;
+      const contributionId = req.params.id;
+      
+      const contribution = await storage.approveContribution(contributionId, userId);
+      res.json(contribution);
     } catch (error) {
-      console.error("Cleanup expired invites error:", error);
+      console.error("Error approving contribution:", error);
+      res.status(500).json({ message: "Failed to approve contribution" });
     }
-  }, 60 * 60 * 1000); // Every hour
+  });
 
+  app.put('/api/contributions/:id/reject', isAuthenticated, async (req: any, res) => {
+    try {
+      const contributionId = req.params.id;
+      const { reason } = req.body;
+      
+      const contribution = await storage.rejectContribution(contributionId, reason);
+      res.json(contribution);
+    } catch (error) {
+      console.error("Error rejecting contribution:", error);
+      res.status(500).json({ message: "Failed to reject contribution" });
+    }
+  });
+
+  // Expense routes
+  app.get('/api/events/:id/expenses', isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const eventId = req.params.id;
+      
+      const isManager = await storage.isEventManager(eventId, userId);
+      if (!isManager) {
+        return res.status(403).json({ message: "Access denied" });
+      }
+
+      const expenses = await storage.getExpensesByEventId(eventId);
+      res.json(expenses);
+    } catch (error) {
+      console.error("Error fetching expenses:", error);
+      res.status(500).json({ message: "Failed to fetch expenses" });
+    }
+  });
+
+  app.get('/api/events/:id/expenses/public', async (req, res) => {
+    try {
+      const eventId = req.params.id;
+      const expenses = await storage.getExpensesByEventId(eventId);
+      res.json(expenses);
+    } catch (error) {
+      console.error("Error fetching public expenses:", error);
+      res.status(500).json({ message: "Failed to fetch expenses" });
+    }
+  });
+
+  app.post('/api/events/:id/expenses', isAuthenticated, upload.single('receipt'), async (req: any, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const eventId = req.params.id;
+      
+      const isManager = await storage.isEventManager(eventId, userId);
+      if (!isManager) {
+        return res.status(403).json({ message: "Access denied" });
+      }
+
+      const expenseData = insertExpenseSchema.parse({
+        ...req.body,
+        eventId,
+        date: new Date(req.body.date),
+        receiptUrl: req.file ? getFileUrl(req.file.filename) : undefined,
+      });
+
+      const expense = await storage.createExpense(expenseData, userId);
+      res.status(201).json(expense);
+    } catch (error) {
+      console.error("Error creating expense:", error);
+      res.status(500).json({ message: "Failed to create expense" });
+    }
+  });
+
+  app.put('/api/expenses/:id', isAuthenticated, upload.single('receipt'), async (req: any, res) => {
+    try {
+      const expenseId = req.params.id;
+      const updates = insertExpenseSchema.partial().parse({
+        ...req.body,
+        date: req.body.date ? new Date(req.body.date) : undefined,
+        receiptUrl: req.file ? getFileUrl(req.file.filename) : undefined,
+      });
+
+      const expense = await storage.updateExpense(expenseId, updates);
+      res.json(expense);
+    } catch (error) {
+      console.error("Error updating expense:", error);
+      res.status(500).json({ message: "Failed to update expense" });
+    }
+  });
+
+  app.delete('/api/expenses/:id', isAuthenticated, async (req: any, res) => {
+    try {
+      const expenseId = req.params.id;
+      await storage.deleteExpense(expenseId);
+      res.json({ message: "Expense deleted successfully" });
+    } catch (error) {
+      console.error("Error deleting expense:", error);
+      res.status(500).json({ message: "Failed to delete expense" });
+    }
+  });
+
+  // Manager invitation routes
+  app.post('/api/events/:id/invite', isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const eventId = req.params.id;
+      const { email } = req.body;
+      
+      if (!email) {
+        return res.status(400).json({ message: "Email is required" });
+      }
+
+      const isManager = await storage.isEventManager(eventId, userId);
+      if (!isManager) {
+        return res.status(403).json({ message: "Access denied" });
+      }
+
+      const event = await storage.getEventById(eventId);
+      if (!event) {
+        return res.status(404).json({ message: "Event not found" });
+      }
+
+      const inviter = await storage.getUser(userId);
+      if (!inviter) {
+        return res.status(404).json({ message: "Inviter not found" });
+      }
+
+      const invitation = await storage.createManagerInvitation(
+        { eventId, email },
+        userId
+      );
+
+      const inviterName = `${inviter.firstName || ''} ${inviter.lastName || ''}`.trim() || inviter.email || 'Event Manager';
+      
+      const success = await sendCoManagerInvitation(
+        email,
+        event.title,
+        inviterName,
+        invitation.inviteToken
+      );
+
+      if (success) {
+        res.status(201).json({ message: "Invitation sent successfully", invitation });
+      } else {
+        res.status(500).json({ message: "Failed to send invitation email" });
+      }
+    } catch (error) {
+      console.error("Error sending invitation:", error);
+      res.status(500).json({ message: "Failed to send invitation" });
+    }
+  });
+
+  app.get('/api/events/:id/invitations', isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const eventId = req.params.id;
+      
+      const isManager = await storage.isEventManager(eventId, userId);
+      if (!isManager) {
+        return res.status(403).json({ message: "Access denied" });
+      }
+
+      const pendingInvitations = await storage.getPendingInvitationsByEventId(eventId);
+      const activeManagers = await storage.getActiveManagersByEventId(eventId);
+      
+      res.json({ pendingInvitations, activeManagers });
+    } catch (error) {
+      console.error("Error fetching invitations:", error);
+      res.status(500).json({ message: "Failed to fetch invitations" });
+    }
+  });
+
+  app.post('/api/invitations/:token/accept', isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const token = req.params.token;
+      
+      await storage.useManagerInvitation(token, userId);
+      res.json({ message: "Invitation accepted successfully" });
+    } catch (error) {
+      console.error("Error accepting invitation:", error);
+      res.status(500).json({ message: "Failed to accept invitation" });
+    }
+  });
+
+  // Statistics routes
+  app.get('/api/events/:id/statistics', isAuthenticated, async (req: any, res) => {
+    try {
+      const userId = req.user.claims.sub;
+      const eventId = req.params.id;
+      
+      const isManager = await storage.isEventManager(eventId, userId);
+      if (!isManager) {
+        return res.status(403).json({ message: "Access denied" });
+      }
+
+      const statistics = await storage.getEventStatistics(eventId);
+      res.json(statistics);
+    } catch (error) {
+      console.error("Error fetching statistics:", error);
+      res.status(500).json({ message: "Failed to fetch statistics" });
+    }
+  });
+
+  app.get('/api/statistics/high-value-contributors', isAuthenticated, async (req: any, res) => {
+    try {
+      const eventId = req.query.eventId as string;
+      const minAmount = parseInt(req.query.minAmount as string) || 100;
+      
+      const contributors = await storage.getHighValueContributors(eventId, minAmount);
+      res.json(contributors);
+    } catch (error) {
+      console.error("Error fetching high-value contributors:", error);
+      res.status(500).json({ message: "Failed to fetch high-value contributors" });
+    }
+  });
+
+  const httpServer = createServer(app);
   return httpServer;
 }

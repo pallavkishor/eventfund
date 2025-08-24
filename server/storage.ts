@@ -1,357 +1,433 @@
 import {
   users,
   events,
-  eventManagers,
-  contributors,
   contributions,
   expenses,
-  managerInvites,
-  passwordResetTokens,
+  eventManagers,
+  managerInvitations,
   type User,
-  type InsertUser,
+  type UpsertUser,
   type Event,
+  type EventWithDetails,
   type InsertEvent,
-  type Contributor,
-  type InsertContributor,
   type Contribution,
   type InsertContribution,
   type Expense,
   type InsertExpense,
-  type ManagerInvite,
-  type InsertManagerInvite,
   type EventManager,
-  type UpdateEvent,
-  type UpdateExpense,
-  type PasswordResetToken,
-  type InsertPasswordResetToken,
+  type ManagerInvitation,
+  type InsertManagerInvitation,
 } from "../shared/schema.ts";
 import { db } from "./db.ts";
-import { eq, and, desc, sql, gt } from "drizzle-orm";
+import { eq, and, desc, sum, count, sql } from "drizzle-orm";
 import { randomUUID } from "crypto";
 
 export interface IStorage {
-  // User operations
+  // User operations (mandatory for Replit Auth)
   getUser(id: string): Promise<User | undefined>;
-  getUserByEmail(email: string): Promise<User | undefined>;
-  createUser(user: InsertUser): Promise<User>;
+  upsertUser(user: UpsertUser): Promise<User>;
 
   // Event operations
-  getEvent(id: string): Promise<Event | undefined>;
-  getEventByAccessCode(accessCode: string): Promise<Event | undefined>;
-  createEvent(event: InsertEvent & { createdById: string }): Promise<Event>;
-  updateEvent(id: string, event: UpdateEvent): Promise<Event>;
-  getEventsByManager(userId: string): Promise<Event[]>;
-
-  // Event manager operations
-  addEventManager(eventId: string, userId: string): Promise<void>;
+  createEvent(event: InsertEvent, creatorId: string): Promise<Event>;
+  getEventsByUserId(userId: string): Promise<EventWithDetails[]>;
+  getEventByAccessCode(accessCode: string): Promise<EventWithDetails | undefined>;
+  getEventById(eventId: string): Promise<EventWithDetails | undefined>;
+  updateEvent(eventId: string, updates: Partial<InsertEvent>): Promise<Event>;
+  deleteEvent(eventId: string): Promise<void>;
   isEventManager(eventId: string, userId: string): Promise<boolean>;
-  getEventManagers(eventId: string): Promise<User[]>;
-
-  // Contributor operations
-  getContributor(id: string): Promise<Contributor | undefined>;
-  getContributorByEmail(eventId: string, email: string): Promise<Contributor | undefined>;
-  createContributor(contributor: InsertContributor): Promise<Contributor>;
 
   // Contribution operations
-  getContribution(id: string): Promise<Contribution | undefined>;
   createContribution(contribution: InsertContribution): Promise<Contribution>;
-  updateContributionStatus(id: string, status: "approved" | "rejected", approvedById: string): Promise<Contribution>;
-  getEventContributions(eventId: string): Promise<Contribution[]>;
-  getContributorContributions(contributorId: string): Promise<Contribution[]>;
-  getEventStats(eventId: string): Promise<{
+  getContributionsByEventId(eventId: string): Promise<Contribution[]>;
+  getContributionsByContributorName(eventId: string, contributorName: string): Promise<Contribution[]>;
+  approveContribution(contributionId: string, approverId: string): Promise<Contribution>;
+  rejectContribution(contributionId: string, reason: string): Promise<Contribution>;
+
+  // Expense operations
+  createExpense(expense: InsertExpense, addedBy: string): Promise<Expense>;
+  getExpensesByEventId(eventId: string): Promise<Expense[]>;
+  updateExpense(expenseId: string, updates: Partial<InsertExpense>): Promise<Expense>;
+  deleteExpense(expenseId: string): Promise<void>;
+
+  // Manager invitation operations
+  createManagerInvitation(invitation: InsertManagerInvitation, invitedBy: string): Promise<ManagerInvitation>;
+  getManagerInvitationByToken(token: string): Promise<ManagerInvitation | undefined>;
+  useManagerInvitation(token: string, userId: string): Promise<void>;
+  getPendingInvitationsByEventId(eventId: string): Promise<ManagerInvitation[]>;
+  getActiveManagersByEventId(eventId: string): Promise<(EventManager & { user: User })[]>;
+
+  // Statistics
+  getEventStatistics(eventId: string): Promise<{
     totalCollected: string;
-    totalContributors: number;
-    pendingRequests: number;
     totalExpenses: string;
+    contributorsCount: number;
+    pendingRequests: number;
+    remainingFunds: string;
   }>;
-
-  // Expense operations
-  createExpense(expense: InsertExpense & { addedById: string }): Promise<Expense>;
-  getEventExpenses(eventId: string): Promise<Expense[]>;
-
-  // Manager invite operations
-  createManagerInvite(invite: InsertManagerInvite & { invitedBy: string; token: string; expiresAt: Date }): Promise<ManagerInvite>;
-  getManagerInvite(token: string): Promise<ManagerInvite | undefined>;
-  useManagerInvite(token: string): Promise<void>;
-
-  // Expense operations
-  updateExpense(id: string, expense: UpdateExpense): Promise<Expense>;
-
-  // Password reset operations
-  createPasswordResetToken(token: InsertPasswordResetToken): Promise<PasswordResetToken>;
-  getPasswordResetToken(token: string): Promise<PasswordResetToken | undefined>;
-  usePasswordResetToken(token: string): Promise<void>;
-  updateUserPassword(userId: string, hashedPassword: string): Promise<void>;
-  cleanupExpiredInvites(): Promise<void>;
+  getHighValueContributors(eventId?: string, minAmount?: number): Promise<Contribution[]>;
 }
 
 export class DatabaseStorage implements IStorage {
+  // User operations
   async getUser(id: string): Promise<User | undefined> {
     const [user] = await db.select().from(users).where(eq(users.id, id));
     return user;
   }
 
-  async getUserByEmail(email: string): Promise<User | undefined> {
-    const [user] = await db.select().from(users).where(eq(users.email, email));
+  async upsertUser(userData: UpsertUser): Promise<User> {
+    const [user] = await db
+      .insert(users)
+      .values(userData)
+      .onConflictDoUpdate({
+        target: users.id,
+        set: {
+          ...userData,
+          updatedAt: new Date(),
+        },
+      })
+      .returning();
     return user;
   }
 
-  async createUser(insertUser: InsertUser): Promise<User> {
-    const [user] = await db.insert(users).values(insertUser).returning();
-    return user;
+  // Event operations
+  async createEvent(event: InsertEvent, creatorId: string): Promise<Event> {
+    const [createdEvent] = await db
+      .insert(events)
+      .values({
+        ...event,
+        createdBy: creatorId,
+      })
+      .returning();
+
+    // Add creator as event manager with 'owner' role
+    await db.insert(eventManagers).values({
+      eventId: createdEvent.id,
+      userId: creatorId,
+      role: 'owner',
+    });
+
+    return createdEvent;
   }
 
-  async getEvent(id: string): Promise<Event | undefined> {
-    const [event] = await db.select().from(events).where(eq(events.id, id));
-    return event;
+  async getEventsByUserId(userId: string): Promise<EventWithDetails[]> {
+    const userEvents = await db
+      .select({
+        event: events,
+        creator: users,
+      })
+      .from(eventManagers)
+      .innerJoin(events, eq(eventManagers.eventId, events.id))
+      .innerJoin(users, eq(events.createdBy, users.id))
+      .where(eq(eventManagers.userId, userId))
+      .orderBy(desc(events.createdAt));
+
+    const eventsWithDetails = await Promise.all(
+      userEvents.map(async ({ event, creator }) => {
+        const stats = await this.getEventStatistics(event.id);
+        return {
+          ...event,
+          creator,
+          ...stats,
+        };
+      })
+    );
+
+    return eventsWithDetails;
   }
 
-  async getEventByAccessCode(accessCode: string): Promise<Event | undefined> {
-    const [event] = await db.select().from(events).where(eq(events.accessCode, accessCode));
-    return event;
+  async getEventByAccessCode(accessCode: string): Promise<EventWithDetails | undefined> {
+    const [result] = await db
+      .select({
+        event: events,
+        creator: users,
+      })
+      .from(events)
+      .innerJoin(users, eq(events.createdBy, users.id))
+      .where(eq(events.accessCode, accessCode));
+
+    if (!result) return undefined;
+
+    const stats = await this.getEventStatistics(result.event.id);
+    return {
+      ...result.event,
+      creator: result.creator,
+      ...stats,
+    };
   }
 
-  async updateEvent(id: string, eventData: UpdateEvent): Promise<Event> {
+  async getEventById(eventId: string): Promise<EventWithDetails | undefined> {
+    const [result] = await db
+      .select({
+        event: events,
+        creator: users,
+      })
+      .from(events)
+      .innerJoin(users, eq(events.createdBy, users.id))
+      .where(eq(events.id, eventId));
+
+    if (!result) return undefined;
+
+    const stats = await this.getEventStatistics(eventId);
+    return {
+      ...result.event,
+      creator: result.creator,
+      ...stats,
+    };
+  }
+
+  async updateEvent(eventId: string, updates: Partial<InsertEvent>): Promise<Event> {
     const [updatedEvent] = await db
       .update(events)
-      .set({ ...eventData, updatedAt: new Date() })
-      .where(eq(events.id, id))
+      .set({
+        ...updates,
+        updatedAt: new Date(),
+      })
+      .where(eq(events.id, eventId))
       .returning();
     return updatedEvent;
   }
 
-  async createEvent(event: InsertEvent & { createdById: string }): Promise<Event> {
-    // Generate unique access code
-    const accessCode = Math.random().toString(36).substring(2, 8).toUpperCase();
-    const [newEvent] = await db.insert(events).values({
-      ...event,
-      accessCode,
-    }).returning();
-    
-    // Add creator as event manager
-    await this.addEventManager(newEvent.id, event.createdById);
-    
-    return newEvent;
-  }
-
-  async getEventsByManager(userId: string): Promise<Event[]> {
-    const results = await db
-      .select({ event: events })
-      .from(events)
-      .innerJoin(eventManagers, eq(events.id, eventManagers.eventId))
-      .where(eq(eventManagers.userId, userId))
-      .orderBy(desc(events.createdAt));
-    
-    return results.map(r => r.event);
-  }
-
-  async addEventManager(eventId: string, userId: string): Promise<void> {
-    await db.insert(eventManagers).values({ eventId, userId });
+  async deleteEvent(eventId: string): Promise<void> {
+    await db.delete(events).where(eq(events.id, eventId));
   }
 
   async isEventManager(eventId: string, userId: string): Promise<boolean> {
-    const [result] = await db
+    const [manager] = await db
       .select()
       .from(eventManagers)
       .where(and(eq(eventManagers.eventId, eventId), eq(eventManagers.userId, userId)));
-    return !!result;
+    return !!manager;
   }
 
-  async getEventManagers(eventId: string): Promise<User[]> {
-    const results = await db
-      .select({ user: users })
-      .from(users)
-      .innerJoin(eventManagers, eq(users.id, eventManagers.userId))
-      .where(eq(eventManagers.eventId, eventId));
-    
-    return results.map(r => r.user);
-  }
-
-  async getContributor(id: string): Promise<Contributor | undefined> {
-    const [contributor] = await db.select().from(contributors).where(eq(contributors.id, id));
-    return contributor;
-  }
-
-  async getContributorByEmail(eventId: string, email: string): Promise<Contributor | undefined> {
-    const [contributor] = await db
-      .select()
-      .from(contributors)
-      .where(and(eq(contributors.eventId, eventId), eq(contributors.email, email)));
-    return contributor;
-  }
-
-  async createContributor(contributor: InsertContributor): Promise<Contributor> {
-    const [newContributor] = await db.insert(contributors).values(contributor).returning();
-    return newContributor;
-  }
-
-  async getContribution(id: string): Promise<Contribution | undefined> {
-    const [contribution] = await db.select().from(contributions).where(eq(contributions.id, id));
-    return contribution;
-  }
-
+  // Contribution operations
   async createContribution(contribution: InsertContribution): Promise<Contribution> {
-    const [newContribution] = await db.insert(contributions).values(contribution).returning();
-    return newContribution;
-  }
-
-  async updateContributionStatus(id: string, status: "approved" | "rejected", approvedById: string): Promise<Contribution> {
-    const [contribution] = await db
-      .update(contributions)
-      .set({ status, approvedById, updatedAt: new Date() })
-      .where(eq(contributions.id, id))
+    const [createdContribution] = await db
+      .insert(contributions)
+      .values(contribution)
       .returning();
-    return contribution;
+    return createdContribution;
   }
 
-  async getEventContributions(eventId: string): Promise<Contribution[]> {
-    return await db
+  async getContributionsByEventId(eventId: string): Promise<Contribution[]> {
+    return db
       .select()
       .from(contributions)
       .where(eq(contributions.eventId, eventId))
       .orderBy(desc(contributions.createdAt));
   }
 
-  async getContributorContributions(contributorId: string): Promise<Contribution[]> {
-    return await db
+  async getContributionsByContributorName(eventId: string, contributorName: string): Promise<Contribution[]> {
+    return db
       .select()
       .from(contributions)
-      .where(eq(contributions.contributorId, contributorId))
+      .where(and(
+        eq(contributions.eventId, eventId),
+        eq(contributions.contributorName, contributorName)
+      ))
       .orderBy(desc(contributions.createdAt));
   }
 
-  async getEventStats(eventId: string): Promise<{
-    totalCollected: string;
-    totalContributors: number;
-    pendingRequests: number;
-    totalExpenses: string;
-  }> {
-    // Get total collected (approved contributions only)
-    const [collectedResult] = await db
-      .select({ 
-        total: sql<string>`COALESCE(SUM(${contributions.amount}), 0)` 
+  async approveContribution(contributionId: string, approverId: string): Promise<Contribution> {
+    const [updatedContribution] = await db
+      .update(contributions)
+      .set({
+        status: 'approved',
+        approvedBy: approverId,
+        approvedAt: new Date(),
       })
-      .from(contributions)
-      .where(and(eq(contributions.eventId, eventId), eq(contributions.status, "approved")));
+      .where(eq(contributions.id, contributionId))
+      .returning();
+    return updatedContribution;
+  }
 
-    // Get total contributors
-    const [contributorsResult] = await db
-      .select({ 
-        count: sql<number>`COUNT(DISTINCT ${contributors.id})` 
+  async rejectContribution(contributionId: string, reason: string): Promise<Contribution> {
+    const [updatedContribution] = await db
+      .update(contributions)
+      .set({
+        status: 'rejected',
+        rejectionReason: reason,
       })
-      .from(contributors)
-      .where(eq(contributors.eventId, eventId));
+      .where(eq(contributions.id, contributionId))
+      .returning();
+    return updatedContribution;
+  }
 
-    // Get pending requests
-    const [pendingResult] = await db
-      .select({ 
-        count: sql<number>`COUNT(*)` 
+  // Expense operations
+  async createExpense(expense: InsertExpense, addedBy: string): Promise<Expense> {
+    const [createdExpense] = await db
+      .insert(expenses)
+      .values({
+        ...expense,
+        addedBy,
       })
-      .from(contributions)
-      .where(and(eq(contributions.eventId, eventId), eq(contributions.status, "pending")));
+      .returning();
+    return createdExpense;
+  }
 
-    // Get total expenses
-    const [expensesResult] = await db
-      .select({ 
-        total: sql<string>`COALESCE(SUM(${expenses.amount}), 0)` 
-      })
+  async getExpensesByEventId(eventId: string): Promise<Expense[]> {
+    return db
+      .select()
       .from(expenses)
-      .where(eq(expenses.eventId, eventId));
-
-    return {
-      totalCollected: collectedResult.total || "0",
-      totalContributors: contributorsResult.count || 0,
-      pendingRequests: pendingResult.count || 0,
-      totalExpenses: expensesResult.total || "0",
-    };
+      .where(eq(expenses.eventId, eventId))
+      .orderBy(desc(expenses.date));
   }
 
-  async createExpense(expense: InsertExpense & { addedById: string }): Promise<Expense> {
-    const [newExpense] = await db.insert(expenses).values(expense).returning();
-    return newExpense;
-  }
-
-  async updateExpense(id: string, expenseData: UpdateExpense): Promise<Expense> {
+  async updateExpense(expenseId: string, updates: Partial<InsertExpense>): Promise<Expense> {
     const [updatedExpense] = await db
       .update(expenses)
-      .set(expenseData)
-      .where(eq(expenses.id, id))
+      .set({
+        ...updates,
+        updatedAt: new Date(),
+      })
+      .where(eq(expenses.id, expenseId))
       .returning();
     return updatedExpense;
   }
 
-  async getEventExpenses(eventId: string): Promise<Expense[]> {
-    return await db
+  async deleteExpense(expenseId: string): Promise<void> {
+    await db.delete(expenses).where(eq(expenses.id, expenseId));
+  }
+
+  // Manager invitation operations
+  async createManagerInvitation(invitation: InsertManagerInvitation, invitedBy: string): Promise<ManagerInvitation> {
+    const inviteToken = randomUUID();
+    const expiresAt = new Date(Date.now() + 2 * 60 * 60 * 1000); // 2 hours from now
+
+    const [createdInvitation] = await db
+      .insert(managerInvitations)
+      .values({
+        ...invitation,
+        inviteToken,
+        invitedBy,
+        expiresAt,
+      })
+      .returning();
+    return createdInvitation;
+  }
+
+  async getManagerInvitationByToken(token: string): Promise<ManagerInvitation | undefined> {
+    const [invitation] = await db
       .select()
+      .from(managerInvitations)
+      .where(eq(managerInvitations.inviteToken, token));
+    return invitation;
+  }
+
+  async useManagerInvitation(token: string, userId: string): Promise<void> {
+    const invitation = await this.getManagerInvitationByToken(token);
+    if (!invitation || invitation.usedAt || invitation.expiresAt < new Date()) {
+      throw new Error('Invalid or expired invitation');
+    }
+
+    // Mark invitation as used
+    await db
+      .update(managerInvitations)
+      .set({ usedAt: new Date() })
+      .where(eq(managerInvitations.inviteToken, token));
+
+    // Add user as event manager
+    await db.insert(eventManagers).values({
+      eventId: invitation.eventId,
+      userId,
+      role: 'co-manager',
+      invitedBy: invitation.invitedBy,
+    });
+  }
+
+  async getPendingInvitationsByEventId(eventId: string): Promise<ManagerInvitation[]> {
+    return db
+      .select()
+      .from(managerInvitations)
+      .where(and(
+        eq(managerInvitations.eventId, eventId),
+        eq(managerInvitations.usedAt, null as any)
+      ))
+      .orderBy(desc(managerInvitations.createdAt));
+  }
+
+  async getActiveManagersByEventId(eventId: string): Promise<(EventManager & { user: User })[]> {
+    const managers = await db
+      .select({
+        manager: eventManagers,
+        user: users,
+      })
+      .from(eventManagers)
+      .innerJoin(users, eq(eventManagers.userId, users.id))
+      .where(eq(eventManagers.eventId, eventId));
+
+    return managers.map(({ manager, user }) => ({ ...manager, user }));
+  }
+
+  // Statistics
+  async getEventStatistics(eventId: string): Promise<{
+    totalCollected: string;
+    totalExpenses: string;
+    contributorsCount: number;
+    pendingRequests: number;
+    remainingFunds: string;
+  }> {
+    // Get approved contributions
+    const [approvedContributionsResult] = await db
+      .select({
+        total: sum(contributions.amount),
+        count: count(contributions.id),
+      })
+      .from(contributions)
+      .where(and(
+        eq(contributions.eventId, eventId),
+        eq(contributions.status, 'approved')
+      ));
+
+    // Get pending contributions
+    const [pendingContributionsResult] = await db
+      .select({
+        count: count(contributions.id),
+      })
+      .from(contributions)
+      .where(and(
+        eq(contributions.eventId, eventId),
+        eq(contributions.status, 'pending')
+      ));
+
+    // Get total expenses
+    const [expensesResult] = await db
+      .select({
+        total: sum(expenses.amount),
+      })
       .from(expenses)
-      .where(eq(expenses.eventId, eventId))
-      .orderBy(desc(expenses.createdAt));
+      .where(eq(expenses.eventId, eventId));
+
+    const totalCollected = approvedContributionsResult?.total || '0';
+    const totalExpenses = expensesResult?.total || '0';
+    const contributorsCount = approvedContributionsResult?.count || 0;
+    const pendingRequests = pendingContributionsResult?.count || 0;
+
+    const remainingFunds = (parseFloat(totalCollected) - parseFloat(totalExpenses)).toFixed(2);
+
+    return {
+      totalCollected,
+      totalExpenses,
+      contributorsCount,
+      pendingRequests,
+      remainingFunds,
+    };
   }
 
-  async createManagerInvite(invite: InsertManagerInvite & { invitedBy: string; token: string; expiresAt: Date }): Promise<ManagerInvite> {
-    const [newInvite] = await db.insert(managerInvites).values(invite).returning();
-    return newInvite;
-  }
+  async getHighValueContributors(eventId?: string, minAmount: number = 100): Promise<Contribution[]> {
+    const conditions = [
+      eq(contributions.status, 'approved'),
+      sql`${contributions.amount} >= ${minAmount}`
+    ];
 
-  async getManagerInvite(token: string): Promise<ManagerInvite | undefined> {
-    const [invite] = await db
+    if (eventId) {
+      conditions.push(eq(contributions.eventId, eventId));
+    }
+
+    return db
       .select()
-      .from(managerInvites)
-      .where(and(
-        eq(managerInvites.token, token),
-        eq(managerInvites.used, false),
-        gt(managerInvites.expiresAt, new Date())
-      ));
-    return invite;
-  }
-
-  async useManagerInvite(token: string): Promise<void> {
-    await db
-      .update(managerInvites)
-      .set({ used: true })
-      .where(eq(managerInvites.token, token));
-  }
-
-  async cleanupExpiredInvites(): Promise<void> {
-    await db
-      .delete(managerInvites)
-      .where(
-        and(
-          eq(managerInvites.used, false),
-          sql`${managerInvites.expiresAt} < NOW()`
-        )
-      );
-  }
-
-  async createPasswordResetToken(tokenData: InsertPasswordResetToken): Promise<PasswordResetToken> {
-    const [token] = await db.insert(passwordResetTokens).values(tokenData).returning();
-    return token;
-  }
-
-  async getPasswordResetToken(token: string): Promise<PasswordResetToken | undefined> {
-    const [resetToken] = await db
-      .select()
-      .from(passwordResetTokens)
-      .where(and(
-        eq(passwordResetTokens.token, token),
-        eq(passwordResetTokens.used, false),
-        gt(passwordResetTokens.expiresAt, new Date())
-      ));
-    return resetToken;
-  }
-
-  async usePasswordResetToken(token: string): Promise<void> {
-    await db
-      .update(passwordResetTokens)
-      .set({ used: true })
-      .where(eq(passwordResetTokens.token, token));
-  }
-
-  async updateUserPassword(userId: string, hashedPassword: string): Promise<void> {
-    await db
-      .update(users)
-      .set({ password: hashedPassword, updatedAt: new Date() })
-      .where(eq(users.id, userId));
+      .from(contributions)
+      .where(and(...conditions))
+      .orderBy(desc(contributions.amount));
   }
 }
 
