@@ -11,8 +11,7 @@ const __dirname = dirname(__filename);
 export default defineConfig({
   plugins: [react()],
   build: {
-    outDir: 'dist',     // Builds to project_root/dist
-    emptyOutDir: true,
+    outDir: "./server/public",
   },
   resolve: {
     alias: {
