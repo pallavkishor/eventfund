@@ -8,6 +8,14 @@ import memoize from "memoizee";
 import connectPg from "connect-pg-simple";
 import { storage } from "./storage.ts";
 
+// Extend session data type
+declare module "express-session" {
+  interface SessionData {
+    originalDomain?: string;
+    returnTo?: string;
+  }
+}
+
 if (!process.env.REPLIT_DOMAINS) {
   throw new Error("Environment variable REPLIT_DOMAINS not provided");
 }
@@ -73,6 +81,10 @@ export async function setupAuth(app: Express) {
   app.use(passport.session());
 
   const config = await getOidcConfig();
+  
+  // Get primary domain (first in the list) for OAuth callbacks
+  const domains = process.env.REPLIT_DOMAINS!.split(",");
+  const primaryDomain = domains[0].trim();
 
   const verify: VerifyFunction = async (
     tokens: client.TokenEndpointResponse & client.TokenEndpointResponseHelpers,
@@ -84,14 +96,16 @@ export async function setupAuth(app: Express) {
     verified(null, user);
   };
 
-  for (const domain of process.env
-    .REPLIT_DOMAINS!.split(",")) {
+  // Create strategies for all domains but use primary domain for callback
+  for (const domain of domains) {
+    const cleanDomain = domain.trim();
     const strategy = new Strategy(
       {
-        name: `replitauth:${domain}`,
+        name: `replitauth:${cleanDomain}`,
         config,
         scope: "openid email profile offline_access",
-        callbackURL: `https://${domain}/api/callback`,
+        // Always use primary domain for callback
+        callbackURL: `https://${primaryDomain}/api/callback`,
       },
       verify,
     );
@@ -101,30 +115,66 @@ export async function setupAuth(app: Express) {
   passport.serializeUser((user: Express.User, cb) => cb(null, user));
   passport.deserializeUser((user: Express.User, cb) => cb(null, user));
 
-  
-
   app.get("/api/login", (req, res, next) => {
+    const requestedDomain = req.hostname;
+    const domains = process.env.REPLIT_DOMAINS!.split(",").map(d => d.trim());
     
-    passport.authenticate(`replitauth:${req.hostname}`, {
+    // Check if domain is allowed
+    if (!domains.includes(requestedDomain)) {
+      return res.status(400).json({ 
+        message: `Domain ${requestedDomain} not configured for authentication` 
+      });
+    }
+    
+    // Store original domain in session for redirect after callback
+    if (req.session) {
+      (req.session as any).originalDomain = requestedDomain;
+      (req.session as any).returnTo = req.query.returnTo as string || '/';
+    }
+    
+    passport.authenticate(`replitauth:${requestedDomain}`, {
       prompt: "login consent",
       scope: ["openid", "email", "profile", "offline_access"],
     })(req, res, next);
   });
 
   app.get("/api/callback", (req, res, next) => {
+    // Get the original domain from session, fallback to primary domain
+    const originalDomain = (req.session as any)?.originalDomain || primaryDomain;
+    const returnTo = (req.session as any)?.returnTo || '/';
     
-    passport.authenticate(`replitauth:${req.hostname}`, {
-      successReturnToOrRedirect: "/",
-      failureRedirect: "/api/login",
-    })(req, res, next);
+    passport.authenticate(`replitauth:${originalDomain}`, {
+      failureRedirect: `https://${originalDomain}/api/login`,
+    })(req, res, (err) => {
+      if (err) {
+        return next(err);
+      }
+      
+      // Clear session data
+      if (req.session) {
+        delete (req.session as any).originalDomain;
+        delete (req.session as any).returnTo;
+      }
+      
+      // If callback is on same domain as original, redirect normally
+      if (req.hostname === originalDomain) {
+        return res.redirect(returnTo);
+      }
+      
+      // If callback is on different domain (primary), redirect to original domain
+      const redirectUrl = `https://${originalDomain}${returnTo}`;
+      return res.redirect(redirectUrl);
+    });
   });
 
   app.get("/api/logout", (req, res) => {
+    const currentDomain = req.hostname;
+    
     req.logout(() => {
       res.redirect(
         client.buildEndSessionUrl(config, {
           client_id: process.env.REPL_ID!,
-          post_logout_redirect_uri: `${req.protocol}://${req.hostname}`,
+          post_logout_redirect_uri: `https://${currentDomain}`,
         }).href
       );
     });
